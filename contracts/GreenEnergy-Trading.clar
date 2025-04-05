@@ -136,3 +136,112 @@
 )
 
 
+;; ==============================================================================
+
+
+(define-public (transfer-credits (recipient principal) (amount uint))
+    (let (
+        (sender-balance (default-to u0 (map-get? credit-holdings tx-sender)))
+    )
+        (asserts! (>= sender-balance amount) err-insufficient-credits)
+        (map-set credit-holdings tx-sender (- sender-balance amount))
+        (map-set credit-holdings recipient 
+            (+ (default-to u0 (map-get? credit-holdings recipient)) amount))
+        (ok true)
+    )
+)
+
+
+
+(define-map producer-ratings
+    {producer: principal, rater: principal}
+    {rating: uint, timestamp: uint}
+)
+
+(define-public (rate-producer (producer principal) (rating uint))
+    (begin
+        (asserts! (and (>= rating u1) (<= rating u5)) (err u109))
+        (asserts! (is-some (map-get? energy-producers producer)) err-not-found)
+        (ok (map-set producer-ratings
+            {producer: producer, rater: tx-sender}
+            {rating: rating, timestamp: stacks-block-height}))
+    )
+)
+
+(define-read-only (get-producer-rating (producer principal) (rater principal))
+    (map-get? producer-ratings {producer: producer, rater: rater})
+)
+
+
+(define-constant credit-expiration-blocks u52560)
+
+(define-map credit-expiry
+    principal
+    {block-height: uint, amount: uint}
+)
+
+(define-public (set-credit-expiry (amount uint))
+    (begin
+        (asserts! (>= (get-credit-balance tx-sender) amount) err-insufficient-credits)
+        (ok (map-set credit-expiry tx-sender
+            {block-height: (+ stacks-block-height credit-expiration-blocks), amount: amount}))
+    )
+)
+
+(define-read-only (check-expired-credits (holder principal))
+    (match (map-get? credit-expiry holder)
+        expired (> stacks-block-height (get block-height expired))
+        false
+    )
+)
+
+
+(define-map discount-tiers
+    uint
+    uint
+)
+
+(define-data-var tier-threshold uint u100)
+
+(define-public (set-discount-tier (purchase-amount uint) (discount-percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= discount-percentage u50) (err u110))
+        (ok (map-set discount-tiers purchase-amount discount-percentage))
+    )
+)
+
+(define-read-only (calculate-discounted-price (amount uint))
+    (let (
+        (base-price (* amount (var-get credit-price)))
+        (discount-rate (default-to u0 (map-get? discount-tiers amount)))
+    )
+        (- base-price (/ (* base-price discount-rate) u100))
+    )
+)
+
+
+(define-map certification-levels
+    principal
+    {level: uint, certified-at: uint}
+)
+
+(define-constant max-certification-level u3)
+
+(define-public (update-certification-level (producer principal) (new-level uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-level max-certification-level) (err u111))
+        (asserts! (is-some (map-get? energy-producers producer)) err-not-found)
+        (ok (map-set certification-levels producer
+            {level: new-level, certified-at: stacks-block-height}))
+    )
+)
+
+(define-read-only (get-certification-level (producer principal))
+    (default-to 
+        {level: u0, certified-at: u0}
+        (map-get? certification-levels producer)
+    )
+)
+
