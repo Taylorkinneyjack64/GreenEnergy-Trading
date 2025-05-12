@@ -327,3 +327,83 @@
 (define-read-only (get-staking-positions)
     (map-get? staking-positions tx-sender)
 )
+
+
+
+(define-map market-listings
+    uint
+    {
+        seller: principal,
+        amount: uint,
+        price-per-credit: uint,
+        active: bool
+    }
+)
+
+(define-data-var listing-nonce uint u0)
+
+(define-public (create-market-listing (amount uint) (price-per-credit uint))
+    (let (
+        (seller-credits (default-to u0 (map-get? credit-holdings tx-sender)))
+        (current-nonce (var-get listing-nonce))
+    )
+        (asserts! (>= seller-credits amount) err-insufficient-credits)
+        (asserts! (> price-per-credit u0) err-invalid-amount)
+        
+        (map-set credit-holdings tx-sender (- seller-credits amount))
+        
+        (map-set market-listings current-nonce
+            {
+                seller: tx-sender,
+                amount: amount,
+                price-per-credit: price-per-credit,
+                active: true
+            })
+            
+        (var-set listing-nonce (+ current-nonce u1))
+        (ok current-nonce)
+    )
+)
+
+(define-public (purchase-listed-credits (listing-id uint) (purchase-amount uint))
+    (let (
+        (listing (unwrap! (map-get? market-listings listing-id) err-not-found))
+        (total-cost (* purchase-amount (get price-per-credit listing)))
+    )
+        (asserts! (get active listing) (err u140))
+        (asserts! (<= purchase-amount (get amount listing)) err-insufficient-credits)
+        (asserts! (is-eq (stx-transfer? total-cost tx-sender (get seller listing)) (ok true)) (err u141))
+        
+        (map-set credit-holdings tx-sender 
+            (+ (default-to u0 (map-get? credit-holdings tx-sender)) purchase-amount))
+        
+        (if (is-eq purchase-amount (get amount listing))
+            (map-set market-listings listing-id (merge listing {active: false}))
+            (map-set market-listings listing-id 
+                (merge listing {amount: (- (get amount listing) purchase-amount)}))
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-active-listings)
+    (filter active-listing-filter (map unwrap-listing (get-listing-ids)))
+)
+
+(define-private (get-listing-ids)
+    (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+)
+
+(define-private (unwrap-listing (id uint))
+    {id: id, listing: (default-to {
+        seller: contract-owner,
+        amount: u0,
+        price-per-credit: u0,
+        active: false
+    } (map-get? market-listings id))}
+)
+
+(define-private (active-listing-filter (listing {id: uint, listing: {seller: principal, amount: uint, price-per-credit: uint, active: bool}}))
+    (get active (get listing listing))
+)
