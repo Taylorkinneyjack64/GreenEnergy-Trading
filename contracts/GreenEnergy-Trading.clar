@@ -245,3 +245,85 @@
     )
 )
 
+
+
+(define-map staking-positions
+    principal
+    {amount: uint, start-height: uint, last-claim: uint}
+)
+
+(define-constant blocks-per-cycle u144)
+(define-constant reward-rate u5)
+
+(define-public (stake-credits (amount uint))
+    (let (
+        (balance (default-to u0 (map-get? credit-holdings tx-sender)))
+    )
+        (asserts! (>= balance amount) err-insufficient-credits)
+        (map-set credit-holdings tx-sender (- balance amount))
+        (map-set staking-positions tx-sender
+            {
+                amount: amount,
+                start-height: stacks-block-height,
+                last-claim: stacks-block-height
+            })
+        (ok true)
+    )
+)
+
+(define-public (claim-staking-rewards)
+    (let (
+        (position (unwrap! (map-get? staking-positions tx-sender) err-not-found))
+        (cycles-elapsed (/ (- stacks-block-height (get last-claim position)) blocks-per-cycle))
+        (reward-amount (/ (* (get amount position) reward-rate cycles-elapsed) u100))
+    )
+        (asserts! (> cycles-elapsed u0) (err u130))
+        (map-set credit-holdings tx-sender 
+            (+ (default-to u0 (map-get? credit-holdings tx-sender)) reward-amount))
+        (map-set staking-positions tx-sender
+            (merge position {last-claim: stacks-block-height}))
+        (ok reward-amount)
+    )
+)
+
+(define-public (unstake-credits)
+    (let (
+        (position (unwrap! (map-get? staking-positions tx-sender) err-not-found))
+    )
+        (map-set credit-holdings tx-sender 
+            (+ (default-to u0 (map-get? credit-holdings tx-sender)) (get amount position)))
+        (map-delete staking-positions tx-sender)
+        (ok true)
+    )
+)
+
+(define-read-only (get-staking-rewards (holder principal))
+    (let (
+        (position (unwrap! (map-get? staking-positions holder) err-not-found))
+        (cycles-elapsed (/ (- stacks-block-height (get last-claim position)) blocks-per-cycle))
+        (reward-amount (/ (* (get amount position) reward-rate cycles-elapsed) u100))
+    )
+        (ok reward-amount)
+    )
+)
+
+
+(define-read-only (get-staking-balance (holder principal))
+    (default-to u0 (map-get? credit-holdings holder))
+)
+
+
+(define-read-only (get-staking-position (holder principal))
+    (default-to 
+        {amount: u0, start-height: u0, last-claim: u0}
+        (map-get? staking-positions holder)
+    )
+)
+
+(define-read-only (get-staking-history (holder principal))
+    (map-get? staking-positions holder)
+)
+
+(define-read-only (get-staking-positions)
+    (map-get? staking-positions tx-sender)
+)
