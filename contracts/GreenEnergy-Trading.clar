@@ -9,6 +9,41 @@
 (define-constant err-invalid-amount (err u103))
 (define-constant err-unauthorized (err u104))
 
+
+(define-map offset-requirements
+    principal
+    {
+        required-amount: uint,
+        deadline-block: uint,
+        max-price-per-credit: uint,
+        fulfilled-amount: uint,
+        compliance-status: (string-ascii 20)
+    }
+)
+
+(define-map offset-purchases
+    {buyer: principal, purchase-id: uint}
+    {
+        amount: uint,
+        price-paid: uint,
+        purchase-block: uint,
+        seller: principal
+    }
+)
+
+(define-map compliance-reports
+    {company: principal, period: uint}
+    {
+        required: uint,
+        purchased: uint,
+        compliance-percentage: uint,
+        report-generated: uint
+    }
+)
+
+(define-data-var purchase-id-nonce uint u0)
+(define-data-var compliance-period uint u1)
+
 ;; Data Variables
 (define-data-var credit-price uint u1000) ;; Price in STX per credit
 
@@ -387,6 +422,136 @@
     )
 )
 
+
+
+(define-public (register-offset-requirement (required-amount uint) (deadline-blocks uint) (max-price uint))
+    (begin
+        (asserts! (> required-amount u0) err-invalid-amount)
+        (asserts! (> max-price u0) err-invalid-amount)
+        (ok (map-set offset-requirements tx-sender
+            {
+                required-amount: required-amount,
+                deadline-block: (+ stacks-block-height deadline-blocks),
+                max-price-per-credit: max-price,
+                fulfilled-amount: u0,
+                compliance-status: "pending"
+            }))
+    )
+)
+
+(define-public (auto-purchase-offsets (seller principal) (amount uint))
+    (let (
+        (requirement (unwrap! (map-get? offset-requirements tx-sender) err-not-found))
+        (seller-credits (default-to u0 (map-get? credit-holdings seller)))
+        (current-price (var-get credit-price))
+        (total-cost (* amount current-price))
+        (current-purchase-id (var-get purchase-id-nonce))
+        (remaining-need (- (get required-amount requirement) (get fulfilled-amount requirement)))
+    )
+        (asserts! (<= current-price (get max-price-per-credit requirement)) (err u200))
+        (asserts! (>= seller-credits amount) err-insufficient-credits)
+        (asserts! (<= amount remaining-need) (err u201))
+        (asserts! (< stacks-block-height (get deadline-block requirement)) (err u202))
+        
+        (try! (stx-transfer? total-cost tx-sender seller))
+        
+        (map-set credit-holdings seller (- seller-credits amount))
+        (map-set credit-holdings tx-sender 
+            (+ (default-to u0 (map-get? credit-holdings tx-sender)) amount))
+        
+        (map-set offset-purchases {buyer: tx-sender, purchase-id: current-purchase-id}
+            {
+                amount: amount,
+                price-paid: total-cost,
+                purchase-block: stacks-block-height,
+                seller: seller
+            })
+        
+        (let (
+            (new-fulfilled (+ (get fulfilled-amount requirement) amount))
+            (new-status (if (>= new-fulfilled (get required-amount requirement)) "compliant" "partial"))
+        )
+            (map-set offset-requirements tx-sender
+                (merge requirement 
+                    {fulfilled-amount: new-fulfilled, compliance-status: new-status}))
+        )
+        
+        (var-set purchase-id-nonce (+ current-purchase-id u1))
+        (ok current-purchase-id)
+    )
+)
+
+(define-public (generate-compliance-report)
+    (let (
+        (requirement (unwrap! (map-get? offset-requirements tx-sender) err-not-found))
+        (current-period (var-get compliance-period))
+        (compliance-pct (/ (* (get fulfilled-amount requirement) u100) (get required-amount requirement)))
+    )
+        (map-set compliance-reports {company: tx-sender, period: current-period}
+            {
+                required: (get required-amount requirement),
+                purchased: (get fulfilled-amount requirement),
+                compliance-percentage: compliance-pct,
+                report-generated: stacks-block-height
+            })
+        (ok compliance-pct)
+    )
+)
+
+(define-public (update-compliance-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set compliance-period new-period))
+    )
+)
+
+(define-read-only (get-offset-requirement (company principal))
+    (map-get? offset-requirements company)
+)
+
+(define-read-only (get-compliance-status (company principal))
+    (match (map-get? offset-requirements company)
+        requirement (get compliance-status requirement)
+        "not-registered"
+    )
+)
+
+(define-read-only (get-purchase-history (buyer principal) (purchase-id uint))
+    (map-get? offset-purchases {buyer: buyer, purchase-id: purchase-id})
+)
+
+(define-read-only (get-compliance-report (company principal) (period uint))
+    (map-get? compliance-reports {company: company, period: period})
+)
+
+(define-read-only (calculate-compliance-gap (company principal))
+    (match (map-get? offset-requirements company)
+        requirement 
+            (if (> (get required-amount requirement) (get fulfilled-amount requirement))
+                (- (get required-amount requirement) (get fulfilled-amount requirement))
+                u0)
+        u0
+    )
+)
+
+(define-read-only (get-deadline-status (company principal))
+    (match (map-get? offset-requirements company)
+        requirement
+            (if (> stacks-block-height (get deadline-block requirement))
+                "expired"
+                "active")
+        "not-found"
+    )
+)
+
+(define-read-only (estimate-compliance-cost (company principal))
+    (let (
+        (gap (calculate-compliance-gap company))
+        (current-price (var-get credit-price))
+    )
+        (* gap current-price)
+    )
+)
 (define-read-only (get-active-listings)
     (filter active-listing-filter (map unwrap-listing (get-listing-ids)))
 )
@@ -404,6 +569,9 @@
     } (map-get? market-listings id))}
 )
 
+
 (define-private (active-listing-filter (listing {id: uint, listing: {seller: principal, amount: uint, price-per-credit: uint, active: bool}}))
     (get active (get listing listing))
 )
+
+
