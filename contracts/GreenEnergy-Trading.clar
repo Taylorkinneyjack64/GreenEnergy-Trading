@@ -9,6 +9,28 @@
 (define-constant err-invalid-amount (err u103))
 (define-constant err-unauthorized (err u104))
 
+(define-map escrow-agreements
+    uint
+    {
+        buyer: principal,
+        seller: principal,
+        credit-amount: uint,
+        stx-amount: uint,
+        delivery-deadline: uint,
+        energy-delivered: bool,
+        funds-released: bool,
+        dispute-raised: bool
+    }
+)
+
+(define-data-var escrow-id-nonce uint u0)
+
+(define-constant err-escrow-not-found (err u300))
+(define-constant err-escrow-expired (err u301))
+(define-constant err-escrow-already-completed (err u302))
+(define-constant err-escrow-not-seller (err u303))
+(define-constant err-escrow-not-buyer (err u304))
+
 
 (define-map offset-requirements
     principal
@@ -575,3 +597,151 @@
 )
 
 
+
+(define-public (create-escrow (seller principal) (credit-amount uint) (delivery-blocks uint))
+    (let (
+        (escrow-id (var-get escrow-id-nonce))
+        (stx-payment (* credit-amount (var-get credit-price)))
+        (delivery-deadline (+ stacks-block-height delivery-blocks))
+        (seller-credits (default-to u0 (map-get? credit-holdings seller)))
+    )
+        (asserts! (>= seller-credits credit-amount) err-insufficient-credits)
+        (asserts! (> credit-amount u0) err-invalid-amount)
+        (asserts! (> delivery-blocks u0) err-invalid-amount)
+        
+        (try! (stx-transfer? stx-payment tx-sender (as-contract tx-sender)))
+        
+        (map-set credit-holdings seller (- seller-credits credit-amount))
+        
+        (map-set escrow-agreements escrow-id
+            {
+                buyer: tx-sender,
+                seller: seller,
+                credit-amount: credit-amount,
+                stx-amount: stx-payment,
+                delivery-deadline: delivery-deadline,
+                energy-delivered: false,
+                funds-released: false,
+                dispute-raised: false
+            })
+        
+        (var-set escrow-id-nonce (+ escrow-id u1))
+        (ok escrow-id)
+    )
+)
+
+(define-public (confirm-delivery (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+    )
+        (asserts! (is-eq tx-sender (get seller escrow)) err-escrow-not-seller)
+        (asserts! (not (get energy-delivered escrow)) err-escrow-already-completed)
+        (asserts! (< stacks-block-height (get delivery-deadline escrow)) err-escrow-expired)
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {energy-delivered: true}))
+        
+        (ok true)
+    )
+)
+
+(define-public (release-escrow-funds (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+    )
+        (asserts! (get energy-delivered escrow) (err u305))
+        (asserts! (not (get funds-released escrow)) err-escrow-already-completed)
+        
+        (try! (as-contract (stx-transfer? (get stx-amount escrow) tx-sender (get seller escrow))))
+        
+        (map-set credit-holdings (get buyer escrow) 
+            (+ (default-to u0 (map-get? credit-holdings (get buyer escrow))) (get credit-amount escrow)))
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {funds-released: true}))
+        
+        (ok true)
+    )
+)
+
+(define-public (raise-dispute (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+    )
+        (asserts! (or (is-eq tx-sender (get buyer escrow)) (is-eq tx-sender (get seller escrow))) err-unauthorized)
+        (asserts! (not (get funds-released escrow)) err-escrow-already-completed)
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {dispute-raised: true}))
+        
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (escrow-id uint) (refund-buyer bool))
+    (let (
+        (escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get dispute-raised escrow) (err u306))
+        (asserts! (not (get funds-released escrow)) err-escrow-already-completed)
+        
+        (if refund-buyer
+            (begin
+                (try! (as-contract (stx-transfer? (get stx-amount escrow) tx-sender (get buyer escrow))))
+                (map-set credit-holdings (get seller escrow) 
+                    (+ (default-to u0 (map-get? credit-holdings (get seller escrow))) (get credit-amount escrow)))
+            )
+            (begin
+                (try! (as-contract (stx-transfer? (get stx-amount escrow) tx-sender (get seller escrow))))
+                (map-set credit-holdings (get buyer escrow) 
+                    (+ (default-to u0 (map-get? credit-holdings (get buyer escrow))) (get credit-amount escrow)))
+            )
+        )
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {funds-released: true}))
+        
+        (ok true)
+    )
+)
+
+(define-public (cancel-expired-escrow (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+    )
+        (asserts! (> stacks-block-height (get delivery-deadline escrow)) err-escrow-expired)
+        (asserts! (not (get energy-delivered escrow)) (err u307))
+        (asserts! (not (get funds-released escrow)) err-escrow-already-completed)
+        
+        (try! (as-contract (stx-transfer? (get stx-amount escrow) tx-sender (get buyer escrow))))
+        
+        (map-set credit-holdings (get seller escrow) 
+            (+ (default-to u0 (map-get? credit-holdings (get seller escrow))) (get credit-amount escrow)))
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {funds-released: true}))
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-escrow-details (escrow-id uint))
+    (map-get? escrow-agreements escrow-id)
+)
+
+(define-read-only (check-escrow-status (escrow-id uint))
+    (match (map-get? escrow-agreements escrow-id)
+        escrow 
+            (if (get funds-released escrow)
+                "completed"
+                (if (get dispute-raised escrow)
+                    "disputed"
+                    (if (get energy-delivered escrow)
+                        "delivered"
+                        (if (> stacks-block-height (get delivery-deadline escrow))
+                            "expired"
+                            "active"))))
+        "not-found"
+    )
+)
