@@ -596,6 +596,308 @@
     (get active (get listing listing))
 )
 
+;; ==============================================================================
+;; DYNAMIC GRID BALANCING SYSTEM
+;; ==============================================================================
+
+;; Grid state tracking
+(define-map grid-state
+    uint ;; time-period (block height divided by period length)
+    {
+        total-supply: uint,
+        total-demand: uint,
+        stability-score: uint,
+        price-multiplier: uint,
+        peak-demand-active: bool
+    }
+)
+
+(define-map grid-contributions
+    {producer: principal, period: uint}
+    {
+        energy-supplied: uint,
+        peak-contribution: uint,
+        stability-bonus: uint,
+        last-contribution-block: uint
+    }
+)
+
+(define-map demand-registrations
+    {consumer: principal, period: uint}
+    {
+        requested-amount: uint,
+        priority-level: uint,
+        max-price-willing: uint,
+        demand-fulfilled: uint
+    }
+)
+
+;; Grid balancing constants
+(define-constant grid-period-blocks u144) ;; ~24 hours in blocks
+(define-constant base-stability-score u100)
+(define-constant max-price-multiplier u300) ;; 3x base price maximum
+(define-constant min-price-multiplier u50)  ;; 0.5x base price minimum
+(define-constant peak-demand-threshold u80) ;; 80% supply utilization triggers peak
+(define-constant stability-bonus-rate u10)  ;; 10% bonus for grid stabilization
+
+;; Grid balancing errors
+(define-constant err-invalid-demand (err u400))
+(define-constant err-grid-period-not-found (err u401))
+(define-constant err-insufficient-grid-supply (err u402))
+(define-constant err-demand-not-registered (err u403))
+
+;; Current grid period calculation
+(define-read-only (get-current-grid-period)
+    (/ stacks-block-height grid-period-blocks)
+)
+
+;; Helper function for minimum value
+(define-private (min-value (a uint) (b uint))
+    (if (< a b) a b)
+)
+
+;; Helper function for maximum value
+(define-private (max-value (a uint) (b uint))
+    (if (> a b) a b)
+)
+
+;; Initialize grid state for current period
+(define-private (ensure-grid-period-exists (period uint))
+    (match (map-get? grid-state period)
+        existing-state true
+        (begin
+            (map-set grid-state period
+                {
+                    total-supply: u0,
+                    total-demand: u0,
+                    stability-score: base-stability-score,
+                    price-multiplier: u100,
+                    peak-demand-active: false
+                })
+            true
+        )
+    )
+)
+
+;; Register energy demand for current period
+(define-public (register-energy-demand (amount uint) (priority uint) (max-price uint))
+    (let (
+        (current-period (get-current-grid-period))
+        (consumer tx-sender)
+    )
+        (asserts! (> amount u0) err-invalid-demand)
+        (asserts! (<= priority u3) err-invalid-demand) ;; Priority levels 1-3
+        (asserts! (> max-price u0) err-invalid-demand)
+        
+        (ensure-grid-period-exists current-period)
+        
+        ;; Update grid demand
+        (let (
+            (current-grid (unwrap! (map-get? grid-state current-period) err-grid-period-not-found))
+            (new-total-demand (+ (get total-demand current-grid) amount))
+        )
+            (map-set grid-state current-period
+                (merge current-grid {total-demand: new-total-demand}))
+        )
+        
+        ;; Register consumer demand
+        (map-set demand-registrations {consumer: consumer, period: current-period}
+            {
+                requested-amount: amount,
+                priority-level: priority,
+                max-price-willing: max-price,
+                demand-fulfilled: u0
+            })
+        
+        (ok true)
+    )
+)
+
+;; Enhanced energy production recording with grid balancing
+(define-public (record-grid-production (amount uint))
+    (let (
+        (producer-data (unwrap! (map-get? energy-producers tx-sender) err-not-found))
+        (is-verified (get is-verified producer-data))
+        (current-period (get-current-grid-period))
+    )
+        (asserts! is-verified err-unauthorized)
+        (asserts! (> amount u0) err-invalid-amount)
+        
+        (ensure-grid-period-exists current-period)
+        
+        ;; Update producer data
+        (map-set energy-producers tx-sender
+            {
+                is-verified: (get is-verified producer-data),
+                total-production: (+ (get total-production producer-data) amount),
+                available-credits: (+ (get available-credits producer-data) amount)
+            })
+        
+        ;; Update grid supply
+        (let (
+            (current-grid (unwrap! (map-get? grid-state current-period) err-grid-period-not-found))
+            (new-total-supply (+ (get total-supply current-grid) amount))
+        )
+            (map-set grid-state current-period
+                (merge current-grid {total-supply: new-total-supply}))
+        )
+        
+        ;; Track producer contribution
+        (let (
+            (existing-contribution (default-to
+                {
+                    energy-supplied: u0,
+                    peak-contribution: u0,
+                    stability-bonus: u0,
+                    last-contribution-block: u0
+                }
+                (map-get? grid-contributions {producer: tx-sender, period: current-period})
+            ))
+        )
+            (map-set grid-contributions {producer: tx-sender, period: current-period}
+                (merge existing-contribution
+                    {
+                        energy-supplied: (+ (get energy-supplied existing-contribution) amount),
+                        last-contribution-block: stacks-block-height
+                    }))
+        )
+        
+        ;; Update grid stability and pricing
+        (try! (update-grid-stability current-period))
+        (ok true)
+    )
+)
+
+;; Calculate and update grid stability metrics
+(define-private (update-grid-stability (period uint))
+    (let (
+        (current-grid (unwrap! (map-get? grid-state period) err-grid-period-not-found))
+        (supply (get total-supply current-grid))
+        (demand (get total-demand current-grid))
+    )
+        (if (> demand u0)
+            (let (
+                ;; Calculate supply/demand ratio (scaled by 100)
+                (supply-ratio (/ (* supply u100) demand))
+                ;; Determine if peak demand conditions exist
+                (is-peak (>= supply-ratio peak-demand-threshold))
+                ;; Calculate stability score based on balance
+                (stability (if (>= supply-ratio u100)
+                    (min-value base-stability-score (+ base-stability-score (/ (- supply-ratio u100) u10)))
+                    (max-value u0 (- base-stability-score (/ (- u100 supply-ratio) u10)))))
+                ;; Calculate dynamic price multiplier
+                (price-mult (if (< supply-ratio u50)
+                    max-price-multiplier
+                    (if (> supply-ratio u150)
+                        min-price-multiplier
+                        (- u150 (/ supply-ratio u2)))))
+            )
+                (map-set grid-state period
+                    (merge current-grid
+                        {
+                            stability-score: stability,
+                            price-multiplier: price-mult,
+                            peak-demand-active: is-peak
+                        }))
+                (ok true)
+            )
+            (ok true) ;; No demand registered yet
+        )
+    )
+)
+
+;; Contribute to peak demand fulfillment with bonus
+(define-public (contribute-peak-energy (amount uint))
+    (let (
+        (current-period (get-current-grid-period))
+        (current-grid (unwrap! (map-get? grid-state current-period) err-grid-period-not-found))
+        (producer-data (unwrap! (map-get? energy-producers tx-sender) err-not-found))
+        (available (get available-credits producer-data))
+    )
+        (asserts! (get peak-demand-active current-grid) (err u404))
+        (asserts! (>= available amount) err-insufficient-credits)
+        
+        ;; Calculate stability bonus
+        (let (
+            (stability-bonus (/ (* amount stability-bonus-rate) u100))
+            (existing-contribution (default-to
+                {
+                    energy-supplied: u0,
+                    peak-contribution: u0,
+                    stability-bonus: u0,
+                    last-contribution-block: u0
+                }
+                (map-get? grid-contributions {producer: tx-sender, period: current-period})
+            ))
+        )
+            ;; Update producer credits with bonus
+            (map-set energy-producers tx-sender
+                (merge producer-data
+                    {available-credits: (+ (- available amount) stability-bonus)}))
+            
+            ;; Track peak contribution
+            (map-set grid-contributions {producer: tx-sender, period: current-period}
+                (merge existing-contribution
+                    {
+                        peak-contribution: (+ (get peak-contribution existing-contribution) amount),
+                        stability-bonus: (+ (get stability-bonus existing-contribution) stability-bonus)
+                    }))
+            
+            (ok stability-bonus)
+        )
+    )
+)
+
+;; Get dynamic credit price based on grid conditions
+(define-read-only (get-dynamic-credit-price)
+    (let (
+        (current-period (get-current-grid-period))
+        (base-price (var-get credit-price))
+    )
+        (match (map-get? grid-state current-period)
+            grid-data (* base-price (/ (get price-multiplier grid-data) u100))
+            base-price
+        )
+    )
+)
+
+;; Get current grid status
+(define-read-only (get-grid-status (period uint))
+    (map-get? grid-state period)
+)
+
+;; Get producer grid contribution
+(define-read-only (get-grid-contribution (producer principal) (period uint))
+    (map-get? grid-contributions {producer: producer, period: period})
+)
+
+;; Get demand registration
+(define-read-only (get-demand-registration (consumer principal) (period uint))
+    (map-get? demand-registrations {consumer: consumer, period: period})
+)
+
+;; Calculate grid balance ratio (supply/demand * 100)
+(define-read-only (calculate-grid-balance (period uint))
+    (match (map-get? grid-state period)
+        grid-data
+            (if (> (get total-demand grid-data) u0)
+                (/ (* (get total-supply grid-data) u100) (get total-demand grid-data))
+                u0)
+        u0
+    )
+)
+
+;; Check if producer qualifies for stability rewards
+(define-read-only (check-stability-rewards (producer principal) (period uint))
+    (match (map-get? grid-contributions {producer: producer, period: period})
+        contribution
+            (and 
+                (> (get peak-contribution contribution) u0)
+                (> (get stability-bonus contribution) u0))
+        false
+    )
+)
+
 
 
 (define-public (create-escrow (seller principal) (credit-amount uint) (delivery-blocks uint))
@@ -745,3 +1047,5 @@
         "not-found"
     )
 )
+
+
