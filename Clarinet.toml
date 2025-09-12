@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/GreenEnergy-Trading.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.energy-performance-index]
+path = 'contracts/energy-performance-index.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
